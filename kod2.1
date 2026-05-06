@@ -1,0 +1,647 @@
+/*
+ * Программа позволяет через меню вызывать разные функции Windows API,
+ * которые работают с памятью: узнавать информацию о системе, смотреть
+ * состояние памяти, выделять и освобождать регионы, менять им защиту
+ * и записывать туда данные. Всё в интерактивном режиме через консоль.
+ */
+
+#include <windows.h>    // основные функции Win32 API: VirtualAlloc, VirtualFree и другие
+#include <iostream>     // ввод и вывод в консоль через cin и cout
+#include <iomanip>      // для форматирования вывода: setw, setfill, setprecision
+#include <string>       // удобная работа со строками в C++
+#include <sstream>      // строковые потоки (здесь напрямую не используются, но пусть будет)
+#include <vector>       // динамический массив для хранения списка выделенных регионов
+#include <algorithm>    // для remove_if при обработке строк
+#include <cstring>      // функции в стиле C для работы со строками (memset, memcpy)
+#include <cstdint>      // целочисленные типы фиксированного размера (uintptr_t)
+
+// В старых версиях компилятора MinGW этой константы может не быть,
+// хотя в Visual Studio она уже определена. На всякий случай добавляем сами.
+#ifndef PROCESSOR_ARCHITECTURE_ARM64
+#define PROCESSOR_ARCHITECTURE_ARM64 12
+#endif
+
+/*
+ * Структура, которая описывает один выделенный нами регион памяти.
+ * Мы будем складывать такие структуры в глобальный вектор g_regions,
+ * чтобы в любой момент знать, какие адреса уже заняты, какого они
+ * размера и передана ли им физическая память.
+ */
+struct Region {
+    LPVOID  base;        // базовый адрес, с которого начинается регион
+    SIZE_T  size;        // размер региона в байтах
+    bool    committed;   // true если физическая память уже выделена (MEM_COMMIT),
+                         // false если только зарезервировали адреса (MEM_RESERVE)
+};
+
+// Глобальный вектор, в котором лежат все выделенные нами регионы.
+// Нужен чтобы при записи в память или изменении защиты проверять,
+// что мы работаем именно с нашей памятью, а не с чужой.
+static std::vector<Region> g_regions;
+
+/*
+ * Функция переводит константы состояния памяти (MEM_COMMIT, MEM_RESERVE, MEM_FREE)
+ * в читаемый текст на русском языке. Принимает значение типа DWORD,
+ * возвращает указатель на строку. Строки лежат в коде программы,
+ * поэтому возвращаемый указатель всегда валидный.
+ */
+static const char* StateToStr(DWORD s) {
+    switch (s) {
+    case MEM_COMMIT:  return "MEM_COMMIT  (передана физическая память)";
+    case MEM_RESERVE: return "MEM_RESERVE (зарезервирован, физической памяти нет)";
+    case MEM_FREE:    return "MEM_FREE    (свободен)";
+    default:          return "НЕИЗВЕСТНОЕ СОСТОЯНИЕ";
+    }
+}
+
+/*
+ * Функция переводит тип памяти (MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE)
+ * в читаемое описание. Тип памяти показывает, откуда взялся этот регион:
+ * из исполняемого файла, из проецируемого файла или это просто
+ * приватная память процесса.
+ */
+static const char* TypeToStr(DWORD t) {
+    switch (t) {
+    case MEM_IMAGE:   return "MEM_IMAGE   (образ исполняемого файла)";
+    case MEM_MAPPED:  return "MEM_MAPPED  (проецируемый в память файл)";
+    case MEM_PRIVATE: return "MEM_PRIVATE (приватная память процесса)";
+    case 0:           return "- (не применимо)";
+    default:          return "НЕИЗВЕСТНЫЙ ТИП";
+    }
+}
+
+/*
+ * Собирает строку с флагами защиты страницы памяти.
+ * Флаги могут комбинироваться через побитовое ИЛИ, поэтому мы проверяем
+ * каждый известный флаг отдельно и дописываем его название в результат.
+ * Если флагов нет (p == 0), возвращаем строку что защиты нет.
+ */
+static std::string ProtectToStr(DWORD p) {
+    if (p == 0) return "- (нет защиты)";
+    std::string result;
+
+    // Маленькая лямбда-функция, которая добавляет название флага к строке.
+    // Если в строке уже что-то есть, сначала ставим разделитель " | ".
+    auto add = [&](const char* s) {
+        if (!result.empty()) result += " | ";
+        result += s;
+    };
+
+    // Проверяем по очереди каждый возможный флаг защиты
+    if (p & PAGE_NOACCESS)          add("PAGE_NOACCESS");
+    if (p & PAGE_READONLY)          add("PAGE_READONLY");
+    if (p & PAGE_READWRITE)         add("PAGE_READWRITE");
+    if (p & PAGE_WRITECOPY)         add("PAGE_WRITECOPY");
+    if (p & PAGE_EXECUTE)           add("PAGE_EXECUTE");
+    if (p & PAGE_EXECUTE_READ)      add("PAGE_EXECUTE_READ");
+    if (p & PAGE_EXECUTE_READWRITE) add("PAGE_EXECUTE_READWRITE");
+    if (p & PAGE_GUARD)             add("PAGE_GUARD");
+    if (p & PAGE_NOCACHE)           add("PAGE_NOCACHE");
+    if (p & PAGE_WRITECOMBINE)      add("PAGE_WRITECOMBINE");
+
+    return result.empty() ? "НЕИЗВЕСТНЫЙ НАБОР ФЛАГОВ" : result;
+}
+
+/*
+ * Парсит 16-ричный адрес из строки, которую ввёл пользователь.
+ * На входе может быть "0x7FFE0000", "7FFE0000" или даже "0X7FFE0000".
+ * Убираем пробелы, отрезаем префикс "0x" если есть, и пробуем
+ * преобразовать оставшуюся строку в число. Результат кладём в out.
+ * Возвращает true если всё получилось, false если строка не похожа на адрес.
+ */
+static bool ParseHexAddress(const std::string& s, void*& out) {
+    std::string t = s;
+
+    // Удаляем все пробельные символы из строки
+    t.erase(std::remove_if(t.begin(), t.end(), ::isspace), t.end());
+
+    // Если строка начинается с "0x" или "0X", отрезаем эти два символа
+    if (t.size() > 2 && (t[0] == '0') && (t[1] == 'x' || t[1] == 'X'))
+        t = t.substr(2);
+
+    // Если после всех отрезаний ничего не осталось — адрес пустой
+    if (t.empty()) return false;
+
+    try {
+        // stoull пробует преобразовать строку в 64-битное беззнаковое число
+        // по основанию 16 (шестнадцатеричная система)
+        unsigned long long v = std::stoull(t, nullptr, 16);
+        // Преобразуем число в указатель через uintptr_t чтобы компилятор не ругался
+        out = reinterpret_cast<void*>(static_cast<uintptr_t>(v));
+        return true;
+    }
+    catch (...) {
+        // Если stoull выбросила исключение (например, в строке были буквы
+        // не из HEX), значит адрес некорректный
+        return false;
+    }
+}
+
+/*
+ * Печатает код последней ошибки Win32 API.
+ * Вызываем когда какая-то функция вернула ошибку и нужно понять,
+ * что именно пошло не так. where — это название места или функции,
+ * где произошла ошибка, чтобы легче было искать в коде.
+ */
+static void PrintLastError(const char* where) {
+    DWORD err = GetLastError();
+    std::cout << "[ОШИБКА] " << where << ": код ошибки " << err << std::endl;
+}
+
+/*
+ * Запрашивает у пользователя размер региона в байтах.
+ * prompt можно заменить при вызове, если нужно другое сообщение.
+ * Возвращает введённое число. После ввода очищает входной буфер
+ * от оставшегося символа перевода строки.
+ */
+static SIZE_T AskSize(const char* prompt = "Введите размер региона в байтах: ") {
+    std::cout << prompt;
+    SIZE_T sz = 0;
+    std::cin >> sz;
+    std::cin.ignore(1024, '\n');  // убираем оставшийся в буфере перевод строки
+    return sz;
+}
+
+/*
+ * Спрашивает пользователя, как выбрать адрес для нового региона:
+ * автоматически (система сама подберёт свободное место) или вручную
+ * (пользователь вводит желаемый адрес в hex). Возвращает nullptr
+ * если выбран автоматический режим, или введённый адрес если ручной.
+ */
+static LPVOID AskBaseAddress() {
+    std::cout << "Режим выбора адреса: 1 — автоматический, 2 — задать вручную: ";
+    int mode = 1;
+    std::cin >> mode;
+    std::cin.ignore(1024, '\n');
+
+    if (mode == 2) {
+        std::cout << "Введите желаемый адрес в hex (например, 0x60000000): ";
+        std::string s;
+        std::getline(std::cin, s);
+        void* addr = nullptr;
+        if (!ParseHexAddress(s, addr)) {
+            std::cout << "Не получилось разобрать адрес, оставляю автоматический.\n";
+            return nullptr;
+        }
+        return addr;
+    }
+    return nullptr;
+}
+
+/*
+ * Пункт меню номер 1.
+ * Вызывает GetSystemInfo и выводит основную информацию о компьютере
+ * и операционной системе: архитектуру процессора, количество ядер,
+ * размер страницы памяти, гранулярность выделения, диапазон адресов,
+ * доступных пользовательскому приложению.
+ */
+static void ShowSystemInfo() {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);  // заполняем структуру данными о системе
+
+    std::cout << "\n Информация о вычислительной системе \n";
+    std::cout << "Тип процессора (устар.)    : " << si.dwProcessorType << "\n";
+
+    // Архитектура процессора — одно из нескольких возможных значений
+    std::cout << "Архитектура процессора      : ";
+    switch (si.wProcessorArchitecture) {
+    case PROCESSOR_ARCHITECTURE_AMD64:   std::cout << "x64 (AMD64)"; break;
+    case PROCESSOR_ARCHITECTURE_INTEL:   std::cout << "x86 (Intel)"; break;
+    case PROCESSOR_ARCHITECTURE_ARM:     std::cout << "ARM";         break;
+    case PROCESSOR_ARCHITECTURE_ARM64:   std::cout << "ARM64";       break;
+    default:                             std::cout << "Неизвестно";   break;
+    }
+
+    std::cout << "\n";
+    std::cout << "Количество процессоров      : " << si.dwNumberOfProcessors << "\n";
+    // dwPageSize — минимальная единица выделения памяти, обычно 4096 байт
+    std::cout << "Размер страницы             : " << si.dwPageSize << " байт\n";
+    // Гранулярность — минимальный шаг при резервировании адресов, обычно 64 КБ
+    std::cout << "Гранулярность выделения     : " << si.dwAllocationGranularity << " байт\n";
+
+    // Минимальный и максимальный адреса, которые может использовать процесс.
+    // Выводим в шестнадцатеричном виде с дополнением нулями до 16 символов.
+    std::cout << "Минимальный адрес приложения: 0x" << std::hex << std::setw(16) << std::setfill('0')
+        << reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress) << std::dec << "\n";
+    std::cout << "Максимальный адрес приложен.: 0x" << std::hex << std::setw(16) << std::setfill('0')
+        << reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress) << std::dec << "\n";
+    // Маска показывает, какие процессоры в системе активны (каждый бит отвечает за одно ядро)
+    std::cout << "Маска активных процессоров  : 0x" << std::hex
+        << static_cast<uintptr_t>(si.dwActiveProcessorMask) << std::dec << "\n";
+}
+
+/*
+ * Пункт меню номер 2.
+ * Показывает текущее состояние памяти в системе: сколько всего ОЗУ,
+ * сколько свободно, сколько занято в файле подкачки, сколько доступно
+ * виртуальной памяти. Использует GlobalMemoryStatusEx.
+ */
+static void ShowMemoryStatus() {
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);  // обязательно заполнить до вызова!
+
+    if (!GlobalMemoryStatusEx(&ms)) {
+        PrintLastError("GlobalMemoryStatusEx");
+        return;
+    }
+
+    // Маленькая функция для перевода байтов в мегабайты.
+    // DWORDLONG — это 64-битное беззнаковое число.
+    auto MB = [](DWORDLONG b) {
+        return static_cast<double>(b) / (1024.0 * 1024.0);
+    };
+
+    std::cout << "\n Состояние виртуальной памяти \n";
+    std::cout << std::fixed << std::setprecision(2);  // два знака после запятой для мегабайт
+    std::cout << "Загрузка памяти                : " << ms.dwMemoryLoad << " %\n";
+    std::cout << "Всего физической памяти (ОЗУ)  : " << MB(ms.ullTotalPhys) << " МБ\n";
+    std::cout << "Свободно физической памяти     : " << MB(ms.ullAvailPhys) << " МБ\n";
+    std::cout << "Всего в файле подкачки         : " << MB(ms.ullTotalPageFile) << " МБ\n";
+    std::cout << "Свободно в файле подкачки      : " << MB(ms.ullAvailPageFile) << " МБ\n";
+    std::cout << "Всего виртуальной памяти       : " << MB(ms.ullTotalVirtual) << " МБ\n";
+    std::cout << "Свободно виртуальной памяти    : " << MB(ms.ullAvailVirtual) << " МБ\n";
+    std::cout.unsetf(std::ios::fixed);  // убираем фиксированный формат вывода
+}
+
+/*
+ * Пункт меню номер 3.
+ * По заданному адресу (вводится с клавиатуры в hex) показывает
+ * информацию о регионе памяти, который содержит этот адрес:
+ * его размер, состояние, текущую защиту, тип памяти.
+ * Работает через VirtualQuery.
+ */
+static void QueryRegion() {
+    std::cout << "Введите адрес в 16-ричном виде (например, 0x7FFE0000): ";
+    std::string s;
+    std::getline(std::cin >> std::ws, s);  // читаем строку, пропуская ведущие пробелы
+
+    void* addr = nullptr;
+    if (!ParseHexAddress(s, addr)) {
+        std::cout << "Адрес введён некорректно.\n";
+        return;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi;
+    // VirtualQuery заполняет структуру mbi информацией о регионе
+    SIZE_T n = VirtualQuery(addr, &mbi, sizeof(mbi));
+    if (n == 0) {
+        PrintLastError("VirtualQuery");
+        return;
+    }
+
+    std::cout << "\n Сведения об участке памяти \n";
+    std::cout << std::hex << std::setfill('0');
+    std::cout << "Базовый адрес региона     : 0x" << std::setw(16)
+        << reinterpret_cast<uintptr_t>(mbi.BaseAddress) << "\n";
+    std::cout << "Базовый адрес выделения   : 0x" << std::setw(16)
+        << reinterpret_cast<uintptr_t>(mbi.AllocationBase) << "\n";
+    std::cout << std::dec;  // возвращаем десятичный вывод
+    std::cout << "Размер региона            : " << mbi.RegionSize << " байт ("
+        << (mbi.RegionSize / 1024) << " КБ)\n";
+    std::cout << "Состояние                 : " << StateToStr(mbi.State) << "\n";
+    std::cout << "Текущая защита            : " << ProtectToStr(mbi.Protect) << "\n";
+    std::cout << "Защита при выделении      : " << ProtectToStr(mbi.AllocationProtect) << "\n";
+    std::cout << "Тип памяти                : " << TypeToStr(mbi.Type) << "\n";
+}
+
+/*
+ * Пункт меню номер 4.
+ * Раздельное резервирование региона и передача ему физической памяти.
+ * Сначала вызывается VirtualAlloc с MEM_RESERVE — только бронируем адреса,
+ * но реальная память под них не выделяется. Затем второй вызов с MEM_COMMIT
+ * подключает физические страницы к уже зарезервированному диапазону.
+ */
+static void ReserveThenCommit() {
+    LPVOID  wanted = AskBaseAddress();
+    SIZE_T  size = AskSize();
+    if (size == 0) {
+        std::cout << "Размер региона должен быть больше нуля.\n";
+        return;
+    }
+
+    // Этап 1: только резервирование.
+    // Флаг PAGE_NOACCESS говорит что пока доступ запрещён.
+    LPVOID p = VirtualAlloc(wanted, size, MEM_RESERVE, PAGE_NOACCESS);
+    if (!p) {
+        PrintLastError("VirtualAlloc(MEM_RESERVE)");
+        return;
+    }
+    std::cout << "[+] Зарезервирован регион по адресу 0x" << std::hex
+        << reinterpret_cast<uintptr_t>(p) << std::dec << "\n";
+
+    // Этап 2: передаём физическую память этому же региону.
+    // Теперь защита PAGE_READWRITE — можно читать и писать.
+    LPVOID q = VirtualAlloc(p, size, MEM_COMMIT, PAGE_READWRITE);
+    if (!q) {
+        PrintLastError("VirtualAlloc(MEM_COMMIT)");
+        // Если передать память не вышло, освобождаем зарезервированный регион
+        VirtualFree(p, 0, MEM_RELEASE);
+        return;
+    }
+    std::cout << "[+] Региону передана физическая память, защита PAGE_READWRITE.\n";
+
+    // Сохраняем информацию о регионе в общем списке
+    g_regions.push_back({ p, size, true });
+}
+
+/*
+ * Пункт меню номер 5.
+ * Одновременное резервирование и передача физической памяти.
+ * Один вызов VirtualAlloc с флагами MEM_RESERVE | MEM_COMMIT делает
+ * сразу оба действия. Быстрее и проще, но менее гибко.
+ */
+static void ReserveAndCommit() {
+    LPVOID  wanted = AskBaseAddress();
+    SIZE_T  size = AskSize();
+    if (size == 0) {
+        std::cout << "Размер региона должен быть больше нуля.\n";
+        return;
+    }
+
+    // Один вызов вместо двух — флаги объединены через побитовое ИЛИ
+    LPVOID p = VirtualAlloc(wanted, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) {
+        PrintLastError("VirtualAlloc(MEM_RESERVE | MEM_COMMIT)");
+        return;
+    }
+
+    std::cout << "[+] Регион выделен и обеспечен физической памятью.\n";
+    std::cout << "    Адрес: 0x" << std::hex << reinterpret_cast<uintptr_t>(p)
+        << std::dec << ", размер: " << size << " байт, защита PAGE_READWRITE.\n";
+
+    g_regions.push_back({ p, size, true });
+}
+
+/*
+ * Пункт меню номер 6.
+ * Записывает строку, введённую с клавиатуры, по указанному адресу памяти.
+ * Перед записью проверяет, что адрес принадлежит одному из наших регионов,
+ * и что текущая защита страницы позволяет запись. Если что-то не так —
+ * выводит предупреждение и отменяет операцию.
+ */
+static void WriteData() {
+    // Если мы ещё не выделили ни одного региона, писать некуда
+    if (g_regions.empty()) {
+        std::cout << "[!] Сначала выделите хотя бы один регион (пункты 4 или 5).\n";
+        return;
+    }
+
+    std::cout << "Введите адрес ячейки памяти (hex), куда будем писать: ";
+    std::string s;
+    std::getline(std::cin >> std::ws, s);
+    void* addr = nullptr;
+    if (!ParseHexAddress(s, addr)) {
+        std::cout << "Некорректный адрес.\n";
+        return;
+    }
+
+    std::cout << "Введите строку для записи: ";
+    std::string data;
+    std::getline(std::cin, data);
+
+    /*
+     * Проверка, что адрес лежит внутри одного из наших выделенных регионов.
+     * Идём по всему списку g_regions и сравниваем адрес с границами каждого.
+     * Учитываем размер строки (data.size() + 1 чтобы влез завершающий ноль),
+     * чтобы не выйти за пределы региона.
+     */
+    bool in_our_region = false;
+    for (auto& r : g_regions) {
+        auto base = reinterpret_cast<uintptr_t>(r.base);
+        auto a = reinterpret_cast<uintptr_t>(addr);
+        // Проверяем что региону передана память и адрес с запасом под строку
+        // находится внутри границ региона
+        if (r.committed && a >= base && a + data.size() + 1 <= base + r.size) {
+            in_our_region = true;
+            break;  // нашли подходящий регион, дальше можно не искать
+        }
+    }
+    if (!in_our_region) {
+        std::cout << "[!] Адрес находится за пределами выделенных регионов — запись отменена.\n";
+        return;
+    }
+
+    /*
+     * Через VirtualQuery смотрим текущую защиту страницы, в которую
+     * попадает наш адрес. Некоторые комбинации защиты запрещают запись,
+     * и попытка записи приведёт к исключению (крашу программы).
+     * Лучше проверить заранее и не допустить падения.
+     */
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) {
+        PrintLastError("VirtualQuery");
+        return;
+    }
+
+    // Флаги, которые разрешают запись в страницу
+    const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+    // Если стоит PAGE_GUARD, PAGE_NOACCESS или нет ни одного флага на запись — нельзя
+    if ((mbi.Protect & PAGE_GUARD) || (mbi.Protect & PAGE_NOACCESS) || !(mbi.Protect & writable)) {
+        std::cout << "[!] Текущая защита (" << ProtectToStr(mbi.Protect)
+            << ") не разрешает запись — операция отменена.\n";
+        return;
+    }
+
+    // Непосредственно копируем строку в память.
+    // data.size() + 1 копирует и завершающий нулевой байт,
+    // чтобы строка корректно читалась как C-строка.
+    memcpy(addr, data.c_str(), data.size() + 1);
+    std::cout << "[+] Записано " << (data.size() + 1) << " байт.\n";
+    // Тут же читаем обратно и выводим чтобы убедиться что запись прошла
+    std::cout << "    Проверка чтением: \"" << reinterpret_cast<const char*>(addr) << "\"\n";
+}
+
+/*
+ * Пункт меню номер 7.
+ * Меняет защиту для участка памяти внутри выделенного региона.
+ * Пользователь вводит адрес начала, размер подрегиона и выбирает
+ * новую защиту из списка. VirtualProtect применяет изменение.
+ */
+static void ChangeProtection() {
+    if (g_regions.empty()) {
+        std::cout << "[!] Сначала выделите регион (пункты 4 или 5).\n";
+        return;
+    }
+
+    std::cout << "Введите адрес начала подрегиона (hex), для которого меняем защиту: ";
+    std::string s;
+    std::getline(std::cin >> std::ws, s);
+    void* addr = nullptr;
+    if (!ParseHexAddress(s, addr)) {
+        std::cout << "Некорректный адрес.\n";
+        return;
+    }
+
+    SIZE_T size = AskSize("Размер подрегиона в байтах: ");
+    if (size == 0) return;
+
+    // Выводим список доступных уровней защиты и ждём выбор
+    std::cout << "Выберите новую защиту:\n"
+        << "  1) PAGE_READONLY          — только чтение\n"
+        << "  2) PAGE_READWRITE         — чтение и запись\n"
+        << "  3) PAGE_NOACCESS          — доступ запрещён\n"
+        << "  4) PAGE_EXECUTE_READ      — выполнение и чтение\n"
+        << "  5) PAGE_EXECUTE_READWRITE — выполнение, чтение и запись\n"
+        << "Ваш выбор: ";
+    int choice = 2;
+    std::cin >> choice;
+    std::cin.ignore(1024, '\n');
+
+    // Сопоставляем номер пункта меню с константой защиты
+    DWORD prot = PAGE_READWRITE;
+    switch (choice) {
+    case 1: prot = PAGE_READONLY;            break;
+    case 2: prot = PAGE_READWRITE;           break;
+    case 3: prot = PAGE_NOACCESS;            break;
+    case 4: prot = PAGE_EXECUTE_READ;        break;
+    case 5: prot = PAGE_EXECUTE_READWRITE;   break;
+    default: std::cout << "Неизвестный вариант, ставлю PAGE_READWRITE.\n"; break;
+    }
+
+    DWORD oldProt = 0;  // сюда запишется старая защита
+    if (!VirtualProtect(addr, size, prot, &oldProt)) {
+        PrintLastError("VirtualProtect");
+        return;
+    }
+
+    std::cout << "[+] Защита изменена.\n";
+    std::cout << "    Старая защита: " << ProtectToStr(oldProt) << "\n";
+    std::cout << "    Новая защита : " << ProtectToStr(prot) << "\n";
+
+    // Для надёжности проверяем через VirtualQuery что защита реально поменялась
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) != 0) {
+        std::cout << "    Проверка VirtualQuery -> текущая защита: "
+            << ProtectToStr(mbi.Protect) << "\n";
+    }
+}
+
+/*
+ * Пункт меню номер 8.
+ * Выводит на экран список всех выделенных нами регионов:
+ * их номер, базовый адрес, размер и есть ли физическая память.
+ */
+static void ListRegions() {
+    if (g_regions.empty()) {
+        std::cout << "[!] Список выделенных регионов пуст.\n";
+        return;
+    }
+
+    std::cout << "\n Список выделенных регионов \n";
+    std::cout << "N   Базовый адрес               Размер (байт)   Физ. память\n";
+    for (size_t i = 0; i < g_regions.size(); ++i) {
+        auto& r = g_regions[i];
+        // Выводим адрес в hex с заполнением нулями до 16 символов
+        std::cout << std::setw(2) << i << "  0x"
+            << std::hex << std::setw(16) << std::setfill('0')
+            << reinterpret_cast<uintptr_t>(r.base)
+            << std::dec << std::setfill(' ')
+            << "   " << std::setw(14) << r.size
+            << "   " << (r.committed ? "да" : "нет") << "\n";
+    }
+}
+
+/*
+ * Пункт меню номер 9.
+ * Освобождает выбранный регион. Сначала показывает список регионов,
+ * потом спрашивает номер. Вызывает VirtualFree с флагом MEM_RELEASE,
+ * который полностью освобождает регион — и физическую память,
+ * и зарезервированные адреса.
+ */
+static void FreeRegion() {
+    ListRegions();
+    if (g_regions.empty()) return;
+
+    std::cout << "Введите номер региона для освобождения (MEM_RELEASE): ";
+    int idx = -1;
+    std::cin >> idx;
+    std::cin.ignore(1024, '\n');
+
+    // Проверяем что номер в допустимых пределах
+    if (idx < 0 || idx >= static_cast<int>(g_regions.size())) {
+        std::cout << "[!] Неверный номер региона.\n";
+        return;
+    }
+
+    // MEM_RELEASE освобождает весь регион целиком.
+    // Второй параметр должен быть 0.
+    if (!VirtualFree(g_regions[idx].base, 0, MEM_RELEASE)) {
+        PrintLastError("VirtualFree(MEM_RELEASE)");
+        return;
+    }
+
+    std::cout << "[+] Регион №" << idx << " освобождён.\n";
+    // Удаляем запись о регионе из нашего списка
+    g_regions.erase(g_regions.begin() + idx);
+}
+
+/*
+ * Выводит главное меню программы со списком всех доступных пунктов.
+ */
+static void ShowMenu() {
+    std::cout << "\n МЕНЮ \n"
+        << " 1. Информация о системе                   (GetSystemInfo)\n"
+        << " 2. Статус виртуальной памяти              (GlobalMemoryStatusEx)\n"
+        << " 3. Сведения об участке памяти             (VirtualQuery)\n"
+        << " 4. Резервирование + передача РАЗДЕЛЬНО    (VirtualAlloc)\n"
+        << " 5. Резервирование + передача ОДНОВРЕМЕННО (VirtualAlloc)\n"
+        << " 6. Запись данных в память\n"
+        << " 7. Изменить защиту региона                (VirtualProtect)\n"
+        << " 8. Показать список выделенных регионов\n"
+        << " 9. Освободить регион                      (VirtualFree)\n"
+        << " 0. Выход\n"
+        << "Выберите пункт меню: ";
+}
+
+/*
+ * Точка входа в программу.
+ * Настраиваем консоль на UTF-8 для корректного отображения кириллицы,
+ * дальше крутим бесконечный цикл с меню, пока пользователь не выберет выход.
+ */
+int main() {
+    // Без этих вызовов русские буквы в консоли Visual Studio могут
+    // отображаться кракозябрами
+    SetConsoleCP(65001);
+    SetConsoleOutputCP(65001);
+
+    std::cout << " Управление виртуальной памятью Win32 \n";
+
+    while (true) {
+        ShowMenu();
+        int choice = -1;
+
+        // Если пользователь ввёл не число — очищаем поток и показываем меню снова
+        if (!(std::cin >> choice)) {
+            std::cin.clear();
+            std::cin.ignore(1024, '\n');
+            continue;
+        }
+        std::cin.ignore(1024, '\n');
+
+        switch (choice) {
+        case 1: ShowSystemInfo();     break;
+        case 2: ShowMemoryStatus();   break;
+        case 3: QueryRegion();        break;
+        case 4: ReserveThenCommit();  break;
+        case 5: ReserveAndCommit();   break;
+        case 6: WriteData();          break;
+        case 7: ChangeProtection();   break;
+        case 8: ListRegions();        break;
+        case 9: FreeRegion();         break;
+        case 0:
+            // Перед выходом освобождаем все регионы, которые могли остаться.
+            // Это хороший тон — не оставлять за собой занятую память.
+            for (auto& r : g_regions) {
+                VirtualFree(r.base, 0, MEM_RELEASE);
+            }
+            g_regions.clear();
+            std::cout << "[+] Все регионы освобождены. Выход из программы.\n";
+            return 0;
+        default:
+            std::cout << "[!] Такого пункта нет, попробуйте ещё раз.\n";
+            break;
+        }
+    }
+}
